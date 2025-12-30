@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
@@ -17,8 +17,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+import wandb
 torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
-torch._dynamo.config.compiled_autograd = True
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -176,33 +176,61 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, n_router: int = 8):
         super().__init__()
         hdim = 4 * dim
         self.fc_w = nn.Parameter(init_linear(torch.empty(hdim, dim)).bfloat16())
         self.proj_w = nn.Parameter(torch.zeros(dim, hdim).bfloat16())
         self.fc_w.wd_mul = 2.0
         self.proj_w.wd_mul = 2.0
+        self.n_router = n_router
 
-    def forward(self, x: Tensor):
+    def load_balance_loss(self, h: Tensor):
+        """
+        KL(U || p), gradient back to h
+        h: (B, T, D)
+        """
+        B, T, D = h.shape
+        x = h.view(B * T, D)
+        W = torch.randn(self.n_router, D, device=x.device, dtype=x.dtype)
+        W = F.normalize(W, dim=-1)
+        probs = F.softmax(x @ W.t(), dim=-1).clamp_min(1e-8)
+        lb_loss = -(1.0 / self.n_router) * torch.log(probs).sum(dim=-1).mean()
+        return lb_loss
+
+    def forward(self, x: Tensor, return_lb_loss: bool = False):
+        lb_loss = None
         x = F.linear(x, self.fc_w)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        if return_lb_loss:
+            lb_loss = 2 * self.load_balance_loss(x)
         x = F.linear(x, self.proj_w)
-        return x
+        return x, lb_loss
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, n_router: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+        self.mlp = MLP(dim, n_router=n_router)
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask, lambdas: Tensor, sa_lambdas: Tensor):
-        x = lambdas[0] * x + lambdas[1] * x0
+    def forward(
+            self,
+            x: Tensor,
+            ve: Tensor | None,
+            x00: Tensor,
+            x01: Tensor,
+            block_mask: BlockMask,
+            lambdas: Tensor,
+            sa_lambdas: Tensor,
+            return_lb_loss: bool = False,
+    ):
+        x = lambdas[0] * x + lambdas[1] * x00 + lambdas[2] * x01
         if self.attn is not None:
             x = x + self.attn(x, ve, block_mask, sa_lambdas)
-        x = x + self.mlp(norm(x))
-        return x
+        mlp_out, lb_loss = self.mlp(norm(x), return_lb_loss=return_lb_loss)
+        x = x + mlp_out
+        return x, lb_loss
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -211,13 +239,14 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, n_router: int = 8):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.embed1 = nn.Embedding(vocab_size, model_dim)
+        self.embed2 = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(5)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i, n_router) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head_w = nn.Parameter(torch.zeros(next_multiple_of_n(vocab_size, n=128), model_dim))
@@ -225,7 +254,7 @@ class GPT(nn.Module):
         assert num_layers % 2 == 0
         self.scalars = nn.Parameter(torch.cat([
             torch.ones(num_layers), # skip_weights
-            *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)], # block lambdas
+            *[torch.tensor([1.0, 0.0, 0.0]) for _ in range(num_layers)], # block lambdas
             *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
         ]))
 
@@ -269,19 +298,20 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, return_lb_loss: bool = False):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        ve = [ve[0], ve[1], ve[2], ve[3], ve[4]] + [None] * (len(self.blocks) - 10) + [ve[0], ve[1], ve[2], ve[3], ve[4]]
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x00 = norm(self.embed1(input_seq)[None]) # use of norm here by @Grad62304977
+        x01 = norm(self.embed2(input_seq)[None])
 
         skip_connections = []
         skip_map = {
@@ -290,25 +320,34 @@ class GPT(nn.Module):
             11: 2,
         }
         skip_weights = self.scalars[:len(self.blocks)]
-        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
-        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
+        lambdas = self.scalars[1 * len(self.blocks): 4 * len(self.blocks)].view(-1, 3)
+        sa_lambdas = self.scalars[4 * len(self.blocks): 6 * len(self.blocks)].view(-1, 2)
+        lb_losses = []
         for i in range(len(self.blocks)):
             if i in skip_map:
                 x = x + skip_weights[skip_map[i]] * skip_connections[skip_map[i]]
-            x = self.blocks[i](x, ve[i], x0, block_masks[i], lambdas[i], sa_lambdas[i])
+            x, lb_loss = self.blocks[i](x, ve[i], x00, x01, block_masks[i], lambdas[i], sa_lambdas[i], return_lb_loss=return_lb_loss)
+            if lb_loss is not None:
+                lb_losses.append(lb_loss)
             skip_connections.append(x)
 
         x = norm(x)
         if self.training:
             logits: Tensor = F.linear(x.flatten(end_dim=1), self.lm_head_w.bfloat16()).float()
             loss = F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq)
-            return loss
+            if not return_lb_loss:
+                return loss
+            lb_loss = torch.stack(lb_losses).mean() if lb_losses else None
+            return loss, lb_loss
 
         loss = 0
         for i in range(4):
             logits: Tensor = F.linear(x.flatten(end_dim=1).chunk(4)[i], self.lm_head_w.bfloat16()).float()
             loss += F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq.chunk(4)[i]) / 4
-        return loss
+        if not return_lb_loss:
+            return loss
+        lb_loss = torch.stack(lb_losses).mean() if lb_losses else None
+        return loss, lb_loss
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -352,10 +391,13 @@ class Hyperparameters:
     train_seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5960 # number of iterations to run
+    num_iterations = 5690 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
+    lb_coef: float = 0.5
+    use_lb_loss: bool = True
     # architecture
     vocab_size = 50257
+    lb_num_routers: int = 64
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
@@ -379,21 +421,16 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id_full}.txt"
     print(logfile)
+    # wandb.login(key="d33eaf2f4dd6ed7a1c8fdce745ee9afd0f627875", relogin=True)
+    wandb_run = wandb.init(project="nanogpt", config=vars(args), name=f"medium_{run_id_full}")
+else:
+    wandb_run = None
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
             if console:
                 print(s)
             print(s, file=f)
-from torch._logging._internal import trace_structured # noqa: E402
-import torch._inductor.codecache # noqa: E402
-import torch._inductor.graph # noqa: E402
-def _patched_trace_structured(name, metadata_fn, **kwargs):
-    if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
-    trace_structured(name, metadata_fn, **kwargs)
-torch._inductor.codecache.trace_structured = _patched_trace_structured
-torch._inductor.graph.trace_structured = _patched_trace_structured
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -412,7 +449,7 @@ print0("="*100)
 ########################################
 
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, model_dim=1024,
-                       max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+                       max_seq_len=max(args.train_seq_len, args.val_seq_len), n_router=args.lb_num_routers).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -421,7 +458,11 @@ for param in model.parameters():
 
 # collect the parameters to optimize
 hidden_matrix_params = sorted((p for p in model.blocks.parameters() if p.ndim >= 2), key=lambda x: x.size(), reverse=True)
-embed_params = [*model.embed.parameters(), *model.value_embeds.parameters()]
+embed_params = [
+    *model.embed1.parameters(),
+    *model.embed2.parameters(),
+    *model.value_embeds.parameters()
+]
 scalar_params = [model.scalars]
 head_params: list[nn.Parameter] = [model.lm_head_w]
 # sanity check
@@ -475,9 +516,15 @@ model: nn.Module = torch.compile(model, dynamic=False)
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
 initial_state = copy.deepcopy(dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]))
-for _ in range(warmup_steps):
+for warmup_step in range(warmup_steps):
+    print0(f"Warmup step {warmup_step+1}/{warmup_steps}")
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+    if args.use_lb_loss:
+        loss, lb_loss = model(inputs.to(torch.int32), targets, get_window_size_blocks(0), return_lb_loss=True)
+        total_loss = loss if lb_loss is None else loss + args.lb_coef * lb_loss
+    else:
+        total_loss = model(inputs.to(torch.int32), targets, get_window_size_blocks(0))
+    total_loss.backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     for opt in optimizers:
@@ -520,8 +567,15 @@ for step in range(train_steps + 1):
                 val_loss += model(inputs, targets, get_window_size_blocks(step))
         val_loss /= val_steps
         del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if master_process and wandb_run is not None:
+            wandb.log({
+                "step": step,
+                "val_loss": val_loss.item(),
+                "train_time_ms": training_time_ms,
+                "val_step_avg_ms": training_time_ms / max(step, 1),
+            })
         model.train()
         # start the clock again
         dist.barrier()
@@ -537,7 +591,13 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    lb_loss = None
+    if args.use_lb_loss:
+        ce_loss, lb_loss = model(inputs, targets, get_window_size_blocks(step), return_lb_loss=True)
+    else:
+        ce_loss = model(inputs, targets, get_window_size_blocks(step))
+    total_loss = ce_loss if lb_loss is None else ce_loss + args.lb_coef * lb_loss
+    total_loss.backward()
     opt2futures = {
         opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future() for p in params]
         for opt, params in opt2params.items()
@@ -558,7 +618,20 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    if master_process and wandb_run is not None:
+        log_data = {
+            "step": step + 1,
+            "train_loss": ce_loss.item(),
+            "train_total_loss": total_loss.item(),
+            "train_time_ms": approx_training_time_ms,
+            "train_step_avg_ms": approx_training_time_ms / (step + 1),
+        }
+        if lb_loss is not None:
+            log_data["train_lb_loss"] = lb_loss.item()
+        wandb.log(log_data)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
     f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if master_process and wandb_run is not None:
+    wandb.finish()
 dist.destroy_process_group()

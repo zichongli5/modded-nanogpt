@@ -411,9 +411,9 @@ def polar_express(G: torch.Tensor):
 
 class NorMuon(torch.optim.Optimizer):
     """
-    Muon - MomentUm Orthogonalized by Newton-schulz
+    NorMuon - Neuron-wise Normalized Muon, adds 
 
-    https://kellerjordan.github.io/posts/muon/
+    Muon optimizer: https://kellerjordan.github.io/posts/muon/
 
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
@@ -605,10 +605,12 @@ class NorMuon(torch.optim.Optimizer):
                 if not state:
                     state["momentum_buffer"] = torch.zeros_like(grad)
                     if i==0:
+                        ### NorMuon addition
                         state["second_momentum_buffer"] = torch.zeros((chunk_size, *grad.shape[:-1], 1), dtype=torch.float32, device=grad.device) if param.size(-2) >= param.size(-1) else torch.zeros((chunk_size, *grad.shape[:-3], 1, grad.shape[-1]), dtype=torch.float32, device=grad.device)
 
                 momentum_buffer = state["momentum_buffer"]
                 if i==0:
+                    ### NorMuon addition
                     second_momentum_buffer = state["second_momentum_buffer"]
 
                 # Apply momentum update directly to the persistent momentum buffer in-place.
@@ -643,7 +645,7 @@ class NorMuon(torch.optim.Optimizer):
             else:
                 v_chunk = polar_express(batched_update_grads)
             
-
+            ### NorMuon addition
             vnorm = v_chunk.norm(dim=(-2,-1), keepdim=True)
             v_mean = torch.mean(v_chunk * v_chunk, dim=-1, keepdim=True) if v_chunk.size(-2) >= v_chunk.size(-1) else torch.mean(v_chunk * v_chunk, dim=-2, keepdim=True)
             second_momentum_buffer.lerp_(v_mean.float(), 1 - group["beta2"])
